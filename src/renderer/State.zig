@@ -9,6 +9,7 @@ const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const unicode = @import("../unicode/main.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -23,10 +24,7 @@ terminal: *terminalpkg.Terminal,
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,
 
-/// Dead key state. This will render the current dead key preedit text
-/// over the cursor. This currently only ever renders a single codepoint.
-/// Preedit can in theory be multiple codepoints long but that is left as
-/// a future exercise.
+/// Input method composition displayed over the terminal cursor.
 preedit: ?Preedit = null,
 
 /// Mouse state. This only contains state relevant to what renderers
@@ -121,11 +119,39 @@ pub const Preedit = struct {
     /// The codepoints to render as preedit text.
     codepoints: []const Codepoint = &.{},
 
+    /// Insertion position in rendered codepoints. Null means the runtime
+    /// did not provide a composition cursor.
+    cursor: ?usize = null,
+
     /// A single codepoint to render as preedit text.
     pub const Codepoint = struct {
         codepoint: u21,
         wide: bool = false,
     };
+
+    /// Convert UTF-8 composition text and its character offset to render state.
+    pub fn init(alloc: Allocator, text: []const u8, cursor: ?usize) !Preedit {
+        const view = try std.unicode.Utf8View.init(text);
+        var it = view.iterator();
+        var codepoints: std.ArrayList(Codepoint) = .empty;
+        defer codepoints.deinit(alloc);
+        var offset: usize = 0;
+        var rendered_cursor: usize = 0;
+        while (it.nextCodepoint()) |cp| {
+            defer offset += 1;
+            const w = unicode.table.get(cp).width;
+            // Match the existing handling of zero-width preedit characters.
+            if (w <= 0) continue;
+            if (cursor) |pos| {
+                if (offset < pos) rendered_cursor += 1;
+            }
+            try codepoints.append(alloc, .{ .codepoint = cp, .wide = w >= 2 });
+        }
+        return .{
+            .codepoints = try codepoints.toOwnedSlice(alloc),
+            .cursor = if (cursor != null) rendered_cursor else null,
+        };
+    }
 
     /// Deinit this preedit that was cre
     pub fn deinit(self: *const Preedit, alloc: Allocator) void {
@@ -136,6 +162,7 @@ pub const Preedit = struct {
     pub fn clone(self: *const Preedit, alloc: Allocator) !Preedit {
         return .{
             .codepoints = try alloc.dupe(Codepoint, self.codepoints),
+            .cursor = self.cursor,
         };
     }
 
@@ -152,15 +179,19 @@ pub const Preedit = struct {
     /// Range returns the start and end x position of the preedit text
     /// along with any codepoint offset necessary to fit the preedit
     /// into the available space.
+    pub const Range = struct {
+        start: terminalpkg.size.CellCountInt,
+        end: terminalpkg.size.CellCountInt,
+        cp_offset: usize,
+        cp_end: usize,
+    };
+
     pub fn range(
         self: *const Preedit,
         start: terminalpkg.size.CellCountInt,
         max: terminalpkg.size.CellCountInt,
-    ) struct {
-        start: terminalpkg.size.CellCountInt,
-        end: terminalpkg.size.CellCountInt,
-        cp_offset: usize,
-    } {
+    ) Range {
+        if (self.cursor) |cursor| return self.cursorRange(start, max, cursor);
         // If our width is greater than the number of cells we have
         // then we need to adjust our codepoint start to a point where
         // our width would be less than the number of cells we have.
@@ -192,11 +223,114 @@ pub const Preedit = struct {
             .start = start -| start_offset,
             .end = end -| start_offset,
             .cp_offset = cp_offset,
+            .cp_end = self.codepoints.len,
+        };
+    }
+
+    /// Keep the composition cursor visible when the text exceeds one row.
+    /// Reserve a cell for the insertion position after the final character.
+    fn cursorRange(self: *const Preedit, start: terminalpkg.size.CellCountInt, max: terminalpkg.size.CellCountInt, cursor: usize) Range {
+        const max_width: usize = @as(usize, max) + 1;
+        var w = self.width() + @intFromBool(cursor == self.codepoints.len);
+        var first: usize = 0;
+        var last = self.codepoints.len;
+        while (w > max_width and first < cursor) : (first += 1) {
+            w -= if (self.codepoints[first].wide) @as(usize, 2) else 1;
+        }
+        while (w > max_width and last > cursor + 1) {
+            last -= 1;
+            w -= if (self.codepoints[last].wide) @as(usize, 2) else 1;
+        }
+        const visible_width = @min(w, max_width);
+        const origin: terminalpkg.size.CellCountInt = @intCast(@min(start, max_width - visible_width));
+        return .{
+            .start = origin,
+            .end = origin + @as(terminalpkg.size.CellCountInt, @intCast(visible_width -| 1)),
+            .cp_offset = first,
+            .cp_end = last,
+        };
+    }
+
+    pub fn cursorCell(self: *const Preedit, start: terminalpkg.size.CellCountInt, max: terminalpkg.size.CellCountInt) ?struct {
+        x: terminalpkg.size.CellCountInt,
+        wide: bool,
+    } {
+        const cursor = self.cursor orelse return null;
+        const r = self.range(start, max);
+        var x: usize = r.start;
+        for (self.codepoints[r.cp_offset..cursor]) |cp| {
+            x += if (cp.wide) @as(usize, 2) else 1;
+        }
+        return .{
+            .x = @intCast(@min(x, max)),
+            .wide = cursor < self.codepoints.len and self.codepoints[cursor].wide and max > 0,
         };
     }
 };
 
 const test_hangul_ga: u21 = 0xAC00; // U+AC00 HANGUL SYLLABLE GA
+
+test "preedit cursor converts character offsets and survives cloning" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // The combining accent is skipped by the existing preedit renderer.
+    var p = try Preedit.init(alloc, "a\u{0301}你好b", 3);
+    defer p.deinit(alloc);
+    try testing.expectEqual(@as(?usize, 2), p.cursor);
+    try testing.expectEqual(@as(usize, 4), p.codepoints.len);
+    const cell = p.cursorCell(2, 19).?;
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 5), cell.x);
+    try testing.expect(cell.wide);
+    const copy = try p.clone(alloc);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(p.cursor, copy.cursor);
+    try testing.expectEqualSlices(Preedit.Codepoint, p.codepoints, copy.codepoints);
+}
+
+test "preedit cursor clamps offsets and preserves runtimes without a cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const p = try Preedit.init(alloc, "你好", 99);
+    defer p.deinit(alloc);
+    try testing.expectEqual(@as(?usize, 2), p.cursor);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 4), p.cursorCell(0, 9).?.x);
+    try testing.expect(!p.cursorCell(0, 9).?.wide);
+    const no_cursor = try Preedit.init(alloc, "你好", null);
+    defer no_cursor.deinit(alloc);
+    try testing.expect(no_cursor.cursorCell(0, 9) == null);
+    try testing.expectError(error.InvalidUtf8, Preedit.init(alloc, "\xff", 0));
+}
+
+test "preedit cursor reserves a cell after wide text at the right edge" {
+    const testing = std.testing;
+    const p: Preedit = .{
+        .codepoints = &.{.{ .codepoint = test_hangul_ga, .wide = true }},
+        .cursor = 1,
+    };
+    const r = p.range(9, 9);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 7), r.start);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), r.end);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), p.cursorCell(9, 9).?.x);
+}
+
+test "preedit cursor stays visible when navigating clipped wide text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var p = try Preedit.init(alloc, "你好世界", 4);
+    defer p.deinit(alloc);
+    const tail = p.range(3, 3);
+    try testing.expectEqual(@as(usize, 3), tail.cp_offset);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 3), p.cursorCell(3, 3).?.x);
+    p.cursor = 0;
+    const head = p.range(3, 3);
+    try testing.expectEqual(@as(usize, 0), head.cp_offset);
+    try testing.expectEqual(@as(usize, 2), head.cp_end);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 0), p.cursorCell(3, 3).?.x);
+    p.cursor = 2;
+    const middle = p.range(3, 3);
+    try testing.expectEqual(@as(usize, 2), middle.cp_offset);
+    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 0), p.cursorCell(3, 3).?.x);
+}
 
 test "preedit range covers exact cell width" {
     const testing = std.testing;

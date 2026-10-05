@@ -2628,6 +2628,15 @@ fn balancePaddingIfNeeded(self: *Surface) void {
 ///
 /// The preedit input must be UTF-8 encoded.
 pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
+    return self.preeditCallbackWithCursor(preedit_, null);
+}
+
+/// The cursor is a UTF-8 character offset, not a byte or terminal cell offset.
+pub fn preeditCallbackWithCursor(
+    self: *Surface,
+    preedit_: ?[]const u8,
+    cursor: ?usize,
+) !void {
     // log.debug("text preeditCallback value={any}", .{preedit_});
 
     // Crash metadata in case we crash in here
@@ -2664,37 +2673,19 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
         return;
     };
 
-    // We convert the UTF-8 text to codepoints.
-    const view = try std.unicode.Utf8View.init(text);
-    var it = view.iterator();
-
-    // Allocate the codepoints slice
-    const Codepoint = rendererpkg.State.Preedit.Codepoint;
-    var codepoints: std.ArrayList(Codepoint) = .empty;
-    defer codepoints.deinit(self.alloc);
-    while (it.nextCodepoint()) |cp| {
-        const width: usize = @intCast(unicode.table.get(cp).width);
-
-        // I've never seen a preedit text with a zero-width character. In
-        // theory its possible but we can't really handle it right now.
-        // Let's just ignore it.
-        if (width <= 0) continue;
-
-        try codepoints.append(
-            self.alloc,
-            .{ .codepoint = cp, .wide = width >= 2 },
-        );
-    }
+    const preedit = try rendererpkg.State.Preedit.init(self.alloc, text, cursor);
 
     // If we have no codepoints, then we're done.
-    if (codepoints.items.len == 0) {
+    if (preedit.codepoints.len == 0) {
+        preedit.deinit(self.alloc);
         try self.queueRender();
         return;
     }
 
-    self.renderer_state.preedit = .{
-        .codepoints = try codepoints.toOwnedSlice(self.alloc),
-    };
+    self.renderer_state.preedit = preedit;
+    if (cursor != null) {
+        _ = self.renderer_thread.mailbox.push(global.io(), .reset_cursor_blink, .instant);
+    }
     try self.queueRender();
 }
 

@@ -3184,17 +3184,18 @@ pub const Surface = extern struct {
 
         // Get our pre-edit string that we'll use to show the user.
         var buf: [*:0]u8 = undefined;
+        var cursor: c_int = 0;
         ctx.as(gtk.IMContext).getPreeditString(
             &buf,
             null,
-            null,
+            &cursor,
         );
         defer glib.free(buf);
         const str = std.mem.sliceTo(buf, 0);
 
         // Update our preedit state in Ghostty core
         // log.warn("GTKIM: preedit change str={s}", .{str});
-        surface.preeditCallback(str) catch |err| {
+        surface.preeditCallbackWithCursor(str, if (cursor >= 0) @intCast(cursor) else null) catch |err| {
             log.warn(
                 "error in preedit callback err={}",
                 .{err},

@@ -2582,6 +2582,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             y: terminal.size.CellCountInt,
             x: [2]terminal.size.CellCountInt,
             cp_offset: usize,
+            cp_end: usize,
         };
 
         /// Convert the terminal state to GPU cells stored in CPU memory. These
@@ -2679,6 +2680,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .y = @intCast(cursor_vp.y),
                     .x = .{ range.start, range.end },
                     .cp_offset = range.cp_offset,
+                    .cp_end = range.cp_end,
                 };
             } else null;
 
@@ -2733,8 +2735,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
                 // need it for styling.
-                const cursor_vp = state.cursor.viewport orelse break :cursor;
+                var cursor = state.cursor;
+                if (preedit) |p| {
+                    const vp = cursor.viewport orelse break :cursor;
+                    const pos = p.cursorCell(vp.x, state.cols - 1) orelse break :cursor;
+                    cursor.viewport.?.x = pos.x;
+                    cursor.viewport.?.wide_tail = false;
+                    cursor.cell = .{ .wide = if (pos.wide) .wide else .narrow };
+                }
+                const cursor_vp = cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
+                    if (preedit != null) break :cursor_style .{};
                     const cells = state.row_data.items(.cells);
                     const cell = cells[cursor_vp.y].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
@@ -2742,9 +2753,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     else
                         .{};
                 };
-
-                // If we have preedit text, we don't setup a cursor
-                if (preedit != null) break :cursor;
 
                 // If there isn't a cursor visual style requested then
                 // we don't render a cursor.
@@ -2768,7 +2776,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .bold = self.config.bold_color,
                             });
                             const bg_style = cursor_style.bg(
-                                &state.cursor.cell,
+                                &cursor.cell,
                                 &state.colors.palette,
                             ) orelse state.colors.background;
 
@@ -2790,14 +2798,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 self.addCursor(
-                    &state.cursor,
+                    &cursor,
                     style,
                     cursor_color,
                 );
 
                 // If the cursor is visible then we set our uniforms.
                 if (style == .block) {
-                    const wide = state.cursor.cell.wide;
+                    const wide = cursor.cell.wide;
 
                     self.uniforms.cursor_pos = .{
                         // If we are a spacer tail of a wide cell, our cursor needs
@@ -2829,7 +2837,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .bold = self.config.bold_color,
                         });
                         const bg_style = cursor_style.bg(
-                            &state.cursor.cell,
+                            &cursor.cell,
                             &state.colors.palette,
                         ) orelse state.colors.background;
 
@@ -2860,7 +2868,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (preedit) |preedit_v| preedit: {
                 const range = preedit_range orelse break :preedit;
                 var x = range.x[0];
-                for (preedit_v.codepoints[range.cp_offset..]) |cp| {
+                for (preedit_v.codepoints[range.cp_offset..range.cp_end]) |cp| {
+                    if (@as(usize, x) + @as(usize, if (cp.wide) 2 else 1) > state.cols) break;
                     self.addPreeditCell(
                         cp,
                         .{ .x = x, .y = range.y },
